@@ -1,6 +1,6 @@
 # payment-ecosystem
 
-Install AWS-CLI
+### Install AWS-CLI
 ```sh
 curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
 unzip awscliv2.zip
@@ -8,7 +8,7 @@ sudo ./aws/install
 rm -rf aws awscliv2.zip
 ```
 
-Install Terraform
+### Install Terraform
 ```sh
 sudo apt-get update && sudo apt-get install -y gnupg software-properties-common
 
@@ -30,7 +30,7 @@ terraform -help
 terraform -version
 ```
 
-Commands
+### Commands
 ```sh
 ##### TEST APPLICATION VIA DOCKER-COMPOSE
 docker compose up -d --build
@@ -40,7 +40,10 @@ docker compose down
 ##### TEST APPLICATION LOCALLY
 curl -i -X POST http://localhost:8080/webhooks/p2a/status-updates -H "Content-Type: application/json" -d '{"payoutId":"pay_987654321","status":"PAYOUT_APPROVED","reason":null}'
 
-##### CONFIGURE AWS ACCESS KEY
+##### CHECK MESSAGES USING KAFKA UI
+http://localhost:8090
+
+##### CONFIGURE AWS CREDENTIALS (ACCESS KEY, SECRET KEY, REGION) AND VERIFY ACTIVE IDENTITY
 aws configure
 aws sts get-caller-identity
 
@@ -78,7 +81,7 @@ aws logs tail /ecs/payment-ecosystem/p2a --follow
 ##### REMOVE INFRA
 cd ~/IdeaProjects/payment-ecosystem/infra
 terraform destroy -auto-approve
-```
 
-URLs
-http://localhost:8090
+##### DOUBLE-CHECK (SHOULD RETURN NO RESOURCES)
+terraform state list
+```
