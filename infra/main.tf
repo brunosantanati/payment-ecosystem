@@ -101,10 +101,27 @@ resource "aws_ecr_repository" "p2a" {
 # ------------------------------------------------------------------------------
 # 3. AMAZON MSK (Cluster Kafka Provisioned minimo com autenticacao IAM)
 # ------------------------------------------------------------------------------
+resource "aws_msk_configuration" "kafka_config" {
+  kafka_versions = ["3.8.x"]
+  name           = "${var.project_name}-msk-config"
+
+  server_properties = <<PROPERTIES
+auto.create.topics.enable = true
+default.replication.factor = 2
+min.insync.replicas = 1
+num.partitions = 2
+PROPERTIES
+}
+
 resource "aws_msk_cluster" "kafka" {
   cluster_name           = "${var.project_name}-msk"
   kafka_version          = "3.8.x"
   number_of_broker_nodes = 2 # Minimo exigido pelo MSK (1 broker por AZ)
+
+  configuration_info {
+    arn      = aws_msk_configuration.kafka_config.arn
+    revision = aws_msk_configuration.kafka_config.latest_revision
+  }
 
   broker_node_group_info {
     instance_type   = "kafka.t3.small"
