@@ -12,3 +12,13 @@ output "webhook_url" {
   description = "URL publica do ALB para disparar o webhook do P2A"
   value       = "http://${aws_lb.p2a_alb.dns_name}/webhooks/p2a/status-updates"
 }
+
+output "payout_commands_queue_url" {
+  description = "URL publica HTTPS da fila principal de comandos de payout"
+  value       = aws_sqs_queue.payout_commands.url
+}
+
+output "payout_commands_dlq_url" {
+  description = "URL publica HTTPS da DLQ de comandos de payout"
+  value       = aws_sqs_queue.payout_commands_dlq.url
+}

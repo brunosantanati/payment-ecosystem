@@ -334,3 +334,80 @@ resource "aws_ecs_service" "p2a" {
 
   depends_on = [aws_lb_listener.http]
 }
+
+# ------------------------------------------------------------------------------
+# 6. AMAZON SQS (Fila Principal + DLQ + Redrive Manual + Alarme CloudWatch)
+# ------------------------------------------------------------------------------
+resource "aws_sqs_queue" "payout_commands_dlq" {
+  name                      = "${var.project_name}-payout-commands-dlq"
+  message_retention_seconds = 1209600 # 14 dias
+}
+
+resource "aws_sqs_queue" "payout_commands" {
+  name                       = "${var.project_name}-payout-commands"
+  visibility_timeout_seconds = 60     # >= 6x timeout da chamada HTTP ao WPAP
+  message_retention_seconds  = 345600 # 4 dias
+  receive_wait_time_seconds  = 20     # Long polling
+
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.payout_commands_dlq.arn
+    maxReceiveCount     = 3
+  })
+}
+
+# Habilita o botao/API de DLQ Redrive manual de volta para a fila principal
+resource "aws_sqs_queue_redrive_allow_policy" "payout_commands_dlq_allow" {
+  queue_url = aws_sqs_queue.payout_commands_dlq.id
+
+  redrive_allow_policy = jsonencode({
+    redrivePermission = "byQueue"
+    sourceQueueArns   = [aws_sqs_queue.payout_commands.arn]
+  })
+}
+
+# Policy IAM para acesso da maquina de desenvolvimento e execucao de Redrive manual
+data "aws_iam_policy_document" "payout_sqs_dev_doc" {
+  statement {
+    effect = "Allow"
+    actions = [
+      "sqs:SendMessage",
+      "sqs:ReceiveMessage",
+      "sqs:DeleteMessage",
+      "sqs:ChangeMessageVisibility",
+      "sqs:GetQueueAttributes",
+      "sqs:GetQueueUrl",
+      "sqs:PurgeQueue",
+      "sqs:StartMessageMoveTask",
+      "sqs:CancelMessageMoveTask",
+      "sqs:ListMessageMoveTasks"
+    ]
+    resources = [
+      aws_sqs_queue.payout_commands.arn,
+      aws_sqs_queue.payout_commands_dlq.arn
+    ]
+  }
+}
+
+resource "aws_iam_policy" "payout_sqs_dev_policy" {
+  name        = "${var.project_name}-payout-sqs-dev-policy"
+  description = "Permissoes SQS e DLQ Redrive manual para desenvolvimento local do payout-service"
+  policy      = data.aws_iam_policy_document.payout_sqs_dev_doc.json
+}
+
+# Alarme no CloudWatch disparado assim que >= 1 mensagem entrar na DLQ
+resource "aws_cloudwatch_metric_alarm" "payout_dlq_not_empty" {
+  alarm_name          = "${var.project_name}-payout-dlq-messages-alarm"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  namespace           = "AWS/SQS"
+  period              = 60
+  statistic           = "Maximum"
+  threshold           = 1
+  alarm_description   = "Alerta: Mensagens detectadas na DLQ payment-ecosystem-payout-commands-dlq"
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    QueueName = aws_sqs_queue.payout_commands_dlq.name
+  }
+}

@@ -84,4 +84,69 @@ terraform destroy -auto-approve
 
 ##### DOUBLE-CHECK (SHOULD RETURN NO RESOURCES)
 terraform state list
+
+##### PROVISION SQS + DLQ + CLOUDWATCH ALARM
+
+cd ~/IdeaProjects/payment-ecosystem/infra
+terraform apply \
+  -target=aws_sqs_queue.payout_commands_dlq \
+  -target=aws_sqs_queue.payout_commands \
+  -target=aws_sqs_queue_redrive_allow_policy.payout_commands_dlq_allow \
+  -target=aws_iam_policy.payout_sqs_dev_policy \
+  -target=aws_cloudwatch_metric_alarm.payout_dlq_not_empty \
+  -auto-approve
+  
+##### SEND A MESSAGE TO SQS AND INSPECT IT
+
+QUEUE_URL=$(cd ~/IdeaProjects/payment-ecosystem/infra && terraform output -raw payout_commands_queue_url)
+
+aws sqs send-message \
+  --queue-url "$QUEUE_URL" \
+  --message-body '{"payoutId":"pay_test_001","correlationId":"corr-123","apm":"WERO","amount":150.00,"currency":"EUR","beneficiaryIban":"DE89370400440532013000"}'
+  
+aws sqs receive-message \
+  --queue-url "$QUEUE_URL" \
+  --max-number-of-messages 10 \
+  --visibility-timeout 0 \
+  --attribute-names All \
+  --message-attribute-names All
+  
+###### FORCE MESSAGE INTO DLQ
+  
+QUEUE_URL=$(cd ~/IdeaProjects/payment-ecosystem/infra && terraform output -raw payout_commands_queue_url)
+
+# 1. send msg to principal queue
+aws sqs send-message \
+  --queue-url "$QUEUE_URL" \
+  --message-body '{"payoutId":"pay_force_dlq_001","correlationId":"corr-999","apm":"WERO","amount":150.00,"currency":"EUR","beneficiaryIban":"DE89370400440532013000"}'
+
+# 2. Simulate 3 receipts without delete-message (reaches maxReceiveCount = 3)
+for i in 1 2 3; do
+  echo "Tentativa de leitura $i..."
+  aws sqs receive-message --queue-url "$QUEUE_URL" --max-number-of-messages 1 --visibility-timeout 1 > /dev/null
+  sleep 2
+done
+
+# 3. message finally goes to DLQ and does not return
+aws sqs receive-message --queue-url "$QUEUE_URL" --max-number-of-messages 1 --visibility-timeout 1
+
+##### CHECK MESSAGES IN DLQ
+
+DLQ_URL=$(cd ~/IdeaProjects/payment-ecosystem/infra && terraform output -raw payout_commands_dlq_url)
+
+aws sqs receive-message \
+  --queue-url "$DLQ_URL" \
+  --max-number-of-messages 1 \
+  --visibility-timeout 1 \
+  --attribute-names All \
+  --message-attribute-names All
+  
+##### EXECUTE DLQ REDRIVE MANUALLY
+
+DLQ_ARN=$(aws sqs get-queue-attributes --queue-url "$(cd ~/IdeaProjects/payment-ecosystem/infra && terraform output -raw payout_commands_dlq_url)" --attribute-names QueueArn --query 'Attributes.QueueArn' --output text)
+SRC_ARN=$(aws sqs get-queue-attributes --queue-url "$QUEUE_URL" --attribute-names QueueArn --query 'Attributes.QueueArn' --output text)
+
+aws sqs start-message-move-task \
+  --source-arn "$DLQ_ARN" \
+  --destination-arn "$SRC_ARN"
 ```

@@ -1,0 +1,17 @@
+spring:
+  application:
+    name: payout-service
+  threads:
+    virtual:
+      enabled: true # Virtual Threads para chamadas bloqueantes ao WPAP/Aurora
+  cloud:
+    aws:
+      region:
+        static: us-east-1
+      # Localmente usa ~/.aws/credentials (aws configure) automaticamente.
+      # No ECS Fargate usa a Task Role automaticamente.
+
+app:
+  sqs:
+    payout-commands-queue: payment-ecosystem-payout-commands
+    payout-commands-dlq: payment-ecosystem-payout-commands-dlq
