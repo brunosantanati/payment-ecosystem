@@ -93,7 +93,7 @@ public class PayoutCommandConsumer {
         );
     }
 
-    private void processPayout(PayoutCommandMessage command) {
+    void processPayout(PayoutCommandMessage command) {
         // TODO: Integrar Service de maquina de estados (Aurora) + Client WPAP + Producer Kafka
         log.info("Executando orquestracao de payout para payoutId={} valor={} {}",
                 command.payoutId(), command.amount(), command.currency());
