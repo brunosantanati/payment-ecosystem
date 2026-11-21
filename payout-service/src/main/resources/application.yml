@@ -6,6 +6,9 @@ spring:
       enabled: true # Virtual Threads para chamadas bloqueantes ao WPAP/Aurora
   cloud:
     aws:
+      sqs:
+        listener:
+          message-visibility: 60s
       region:
         static: us-east-1
       # Localmente usa ~/.aws/credentials (aws configure) automaticamente.
