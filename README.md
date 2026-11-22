@@ -149,4 +149,40 @@ SRC_ARN=$(aws sqs get-queue-attributes --queue-url "$QUEUE_URL" --attribute-name
 aws sqs start-message-move-task \
   --source-arn "$DLQ_ARN" \
   --destination-arn "$SRC_ARN"
+  
+##### CHECK PAYOUT-SERVICE + P2A
+
+# Publish a message in SQS
+aws sqs send-message \
+  --queue-url $(aws sqs get-queue-url --queue-name payment-ecosystem-payout-commands --query 'QueueUrl' --output text) \
+  --message-body '{
+    "payoutId": "pay_local_001",
+    "correlationId": "corr_local_001",
+    "apm": "WERO",
+    "amount": 250.00,
+    "currency": "EUR",
+    "beneficiaryIban": "DE89370400440532013000"
+  }'
+  
+# Logs of payout-service (consumption from SQS -> HTTP call to p2a -> insert in Postgres)
+docker logs -f payout-service
+
+# Logs do p2a-service (receipt of POST /webhooks/p2a/status-updates -> publish in Kafka)
+docker logs -f p2a-service
+
+# check DB
+docker exec -it payment-postgres psql -U payout_user -d payout_db
+
+# check table structure
+\d payout_requests
+
+# check table content
+SELECT
+    payout_id,
+    status,
+    jsonb_pretty(payload) AS payload,
+    created_at,
+    version
+FROM payout_requests
+ORDER BY created_at DESC;
 ```

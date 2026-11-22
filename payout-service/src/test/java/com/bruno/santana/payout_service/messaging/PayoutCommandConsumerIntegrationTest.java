@@ -1,7 +1,13 @@
 package com.bruno.santana.payout_service.messaging;
 
+import com.bruno.santana.payout_service.domain.PayoutStatus;
+import com.bruno.santana.payout_service.exception.NonRetryablePayoutException;
+import com.bruno.santana.payout_service.gateway.PayoutGatewayClient;
+import com.bruno.santana.payout_service.repository.PayoutRequestRepository;
 import io.awspring.cloud.sqs.operations.SqsTemplate;
+import io.awspring.cloud.sqs.listener.MessageListenerContainerRegistry;
 import org.awaitility.Awaitility;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -9,8 +15,9 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
-import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
+import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
@@ -20,6 +27,7 @@ import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.sqs.SqsAsyncClient;
 import software.amazon.awssdk.services.sqs.model.CreateQueueRequest;
 import software.amazon.awssdk.services.sqs.model.GetQueueAttributesRequest;
+import software.amazon.awssdk.services.sqs.model.Message;
 import software.amazon.awssdk.services.sqs.model.PurgeQueueRequest;
 import software.amazon.awssdk.services.sqs.model.QueueAttributeName;
 import software.amazon.awssdk.services.sqs.model.ReceiveMessageRequest;
@@ -27,6 +35,7 @@ import software.amazon.awssdk.services.sqs.model.ReceiveMessageRequest;
 import java.math.BigDecimal;
 import java.net.URI;
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -45,7 +54,15 @@ class PayoutCommandConsumerIntegrationTest {
     private static final String DLQ_NAME = "payment-ecosystem-payout-commands-dlq";
     private static final String DEFAULT_IBAN = "DE89370400440532013000";
 
-    // ElasticMQ: 100% open-source (Apache 2.0), leve e sem restrições comerciais
+    // 1. PostgreSQL 16 real para testar persistência JSONB e PK/Idempotência
+    @Container
+    static PostgreSQLContainer<?> postgresContainer = new PostgreSQLContainer<>(
+            DockerImageName.parse("postgres:16-alpine"))
+            .withDatabaseName("payout_test_db")
+            .withUsername("test_user")
+            .withPassword("test_pass");
+
+    // 2. ElasticMQ (100% open-source) para emular SQS + DLQ + RedrivePolicy
     @Container
     static GenericContainer<?> sqsContainer = new GenericContainer<>(
             DockerImageName.parse("softwaremill/elasticmq-native:latest"))
@@ -60,26 +77,34 @@ class PayoutCommandConsumerIntegrationTest {
     @Autowired
     private SqsAsyncClient sqsAsyncClient;
 
-    @MockitoSpyBean
-    private PayoutCommandConsumer consumerSpy;
+    @Autowired
+    private PayoutRequestRepository repository;
+
+    // Mockamos apenas a chamada HTTP externa para o P2A
+    @MockitoBean
+    private PayoutGatewayClient gatewayClient;
 
     @DynamicPropertySource
-    static void registerSqsProperties(DynamicPropertyRegistry registry) {
-        String endpoint = "http://" + sqsContainer.getHost() + ":" + sqsContainer.getMappedPort(9324);
+    static void registerDynamicProperties(DynamicPropertyRegistry registry) {
+        String sqsEndpoint = "http://" + sqsContainer.getHost() + ":" + sqsContainer.getMappedPort(9324);
 
-        registry.add("spring.cloud.aws.sqs.endpoint", () -> endpoint);
+        // SQS Properties
+        registry.add("spring.cloud.aws.sqs.endpoint", () -> sqsEndpoint);
         registry.add("spring.cloud.aws.region.static", () -> "us-east-1");
         registry.add("spring.cloud.aws.credentials.access-key", () -> "test");
         registry.add("spring.cloud.aws.credentials.secret-key", () -> "test");
-
         registry.add("app.sqs.payout-commands-queue", () -> MAIN_QUEUE_NAME);
         registry.add("app.sqs.payout-commands-dlq", () -> DLQ_NAME);
+
+        // Sobrescreve o message-visibility de 60s do application.yml para 2s nos testes
+        registry.add("spring.cloud.aws.sqs.listener.message-visibility", () -> "2s");
+
+        // PostgreSQL Properties
+        registry.add("spring.datasource.url", postgresContainer::getJdbcUrl);
+        registry.add("spring.datasource.username", postgresContainer::getUsername);
+        registry.add("spring.datasource.password", postgresContainer::getPassword);
     }
 
-    /**
-     * Cria as filas ANTES do contexto do Spring Boot subir, garantindo que o @SqsListener
-     * encontre a fila principal imediatamente ao inicializar.
-     */
     @BeforeAll
     static void createQueuesBeforeSpringContext() throws Exception {
         String endpoint = "http://" + sqsContainer.getHost() + ":" + sqsContainer.getMappedPort(9324);
@@ -90,7 +115,6 @@ class PayoutCommandConsumerIntegrationTest {
                 .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test")))
                 .build()) {
 
-            // 1. Cria a DLQ
             dlqUrl = setupClient.createQueue(CreateQueueRequest.builder()
                     .queueName(DLQ_NAME)
                     .build()).get().queueUrl();
@@ -100,8 +124,6 @@ class PayoutCommandConsumerIntegrationTest {
                     .attributeNames(QueueAttributeName.QUEUE_ARN)
                     .build()).get().attributes().get(QueueAttributeName.QUEUE_ARN);
 
-            // 2. Cria a fila principal com VisibilityTimeout de 2s (para o teste de 3 retentativas ser rápido)
-            // e RedrivePolicy nativa do SQS para mover à DLQ após maxReceiveCount = 3
             String redrivePolicy = """
                     {"deadLetterTargetArn":"%s","maxReceiveCount":"3"}
                     """.formatted(dlqArn);
@@ -117,13 +139,19 @@ class PayoutCommandConsumerIntegrationTest {
     }
 
     @BeforeEach
-    void purgeQueues() throws Exception {
+    void cleanState() throws Exception {
+        repository.deleteAll();
         sqsAsyncClient.purgeQueue(PurgeQueueRequest.builder().queueUrl(mainQueueUrl).build()).get();
         sqsAsyncClient.purgeQueue(PurgeQueueRequest.builder().queueUrl(dlqUrl).build()).get();
     }
 
+    @AfterAll
+    static void stopSqsListenersBeforeContainers(@Autowired MessageListenerContainerRegistry registry) {
+        registry.stop();
+    }
+
     @Test
-    void deveProcessarComandoValidoEDeletarDaFilaPrincipal() throws Exception {
+    void deveProcessarComandoValidoSalvarNoBancoEDeletarDaFila() throws Exception {
         String payoutId = UUID.randomUUID().toString();
         String correlationId = UUID.randomUUID().toString();
         PayoutCommandMessage command = new PayoutCommandMessage(
@@ -137,20 +165,51 @@ class PayoutCommandConsumerIntegrationTest {
 
         sqsTemplate.send(MAIN_QUEUE_NAME, command);
 
-        // Aguarda a execução do método processPayout
-        Awaitility.await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
-                verify(consumerSpy, times(1)).processPayout(command)
-        );
+        // Verifica se chamou o P2A e persistiu no PostgreSQL com status PAYOUT_SENT_TO_P2A e payload JSONB
+        Awaitility.await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
+            verify(gatewayClient, times(1)).sendToP2a(command);
 
-        // Garante que ack.acknowledge() removeu a mensagem da fila principal e nada foi para a DLQ
-        Thread.sleep(2500); // Aguarda passar o visibility timeout de 2s para ter certeza que não reaparece
+            var saved = repository.findById(payoutId);
+            assertThat(saved).isPresent();
+            assertThat(saved.get().getStatus()).isEqualTo(PayoutStatus.PAYOUT_SENT_TO_P2A);
+            assertThat(saved.get().getPayload()).contains(payoutId, correlationId, "WERO", "250.00", DEFAULT_IBAN);
+        });
+
+        // Garante que ack.acknowledge() removeu da fila principal e nada caiu na DLQ
+        Thread.sleep(2500);
         assertThat(receiveMessagesFrom(mainQueueUrl)).isEmpty();
         assertThat(receiveMessagesFrom(dlqUrl)).isEmpty();
     }
 
     @Test
-    void deveEncaminharPoisonPillDiretoParaDlqSemRetentar() {
-        // Payload inválido (payoutId em branco e amount nulo)
+    void deveGarantirIdempotenciaQuandoMesmaMensagemForEnviadaDuasVezes() throws Exception {
+        String payoutId = UUID.randomUUID().toString();
+        PayoutCommandMessage command = new PayoutCommandMessage(
+                payoutId,
+                UUID.randomUUID().toString(),
+                "WERO",
+                new BigDecimal("300.00"),
+                "EUR",
+                DEFAULT_IBAN
+        );
+
+        // Envia duas mensagens com o mesmo payoutId (simulando duplicidade do SQS ou Redrive)
+        sqsTemplate.send(MAIN_QUEUE_NAME, command);
+        sqsTemplate.send(MAIN_QUEUE_NAME, command);
+
+        Awaitility.await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
+            assertThat(repository.findById(payoutId)).isPresent();
+            assertThat(receiveMessagesFrom(mainQueueUrl)).isEmpty();
+        });
+
+        // Garante que o P2A foi chamado apenas 1 vez e existe apenas 1 registro no banco
+        verify(gatewayClient, times(1)).sendToP2a(command);
+        assertThat(repository.count()).isEqualTo(1);
+        assertThat(receiveMessagesFrom(dlqUrl)).isEmpty();
+    }
+
+    @Test
+    void deveEncaminharPoisonPillDiretoParaDlqSemSalvarNoBanco() {
         PayoutCommandMessage invalidCommand = new PayoutCommandMessage(
                 "",
                 UUID.randomUUID().toString(),
@@ -162,7 +221,6 @@ class PayoutCommandConsumerIntegrationTest {
 
         sqsTemplate.send(MAIN_QUEUE_NAME, invalidCommand);
 
-        // Deve ir imediatamente para a DLQ com o header dlq-reason = INVALID_PAYLOAD
         Awaitility.await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
             var dlqMessages = receiveMessagesFrom(dlqUrl);
             assertThat(dlqMessages).hasSize(1);
@@ -170,8 +228,8 @@ class PayoutCommandConsumerIntegrationTest {
                     .isEqualTo("INVALID_PAYLOAD");
         });
 
-        // Nunca deve tentar executar a orquestração nem ficar retentando na fila principal
-        verify(consumerSpy, never()).processPayout(any());
+        verify(gatewayClient, never()).sendToP2a(any());
+        assertThat(repository.count()).isZero();
         assertThat(receiveMessagesFrom(mainQueueUrl)).isEmpty();
     }
 
@@ -187,12 +245,11 @@ class PayoutCommandConsumerIntegrationTest {
                 DEFAULT_IBAN
         );
 
-        doThrow(new PayoutCommandConsumer.NonRetryablePayoutException("ACCOUNT_CLOSED"))
-                .when(consumerSpy).processPayout(command);
+        doThrow(new NonRetryablePayoutException("ACCOUNT_CLOSED"))
+                .when(gatewayClient).sendToP2a(command);
 
         sqsTemplate.send(MAIN_QUEUE_NAME, command);
 
-        // Deve ir direto para a DLQ na 1ª tentativa com o motivo da exceção
         Awaitility.await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
             var dlqMessages = receiveMessagesFrom(dlqUrl);
             assertThat(dlqMessages).hasSize(1);
@@ -201,8 +258,8 @@ class PayoutCommandConsumerIntegrationTest {
                     .isEqualTo("ACCOUNT_CLOSED");
         });
 
-        // Garante que foi executado apenas 1 vez (sem retentativas)
-        verify(consumerSpy, times(1)).processPayout(command);
+        verify(gatewayClient, times(1)).sendToP2a(command);
+        assertThat(repository.findById(payoutId)).isEmpty();
         assertThat(receiveMessagesFrom(mainQueueUrl)).isEmpty();
     }
 
@@ -218,26 +275,24 @@ class PayoutCommandConsumerIntegrationTest {
                 DEFAULT_IBAN
         );
 
-        // Simula timeout no WPAP / falha de rede (exceção genérica)
-        doThrow(new RuntimeException("WPAP ReadTimeoutException"))
-                .when(consumerSpy).processPayout(command);
+        doThrow(new RuntimeException("P2A ReadTimeoutException"))
+                .when(gatewayClient).sendToP2a(command);
 
         sqsTemplate.send(MAIN_QUEUE_NAME, command);
 
-        // Como maxReceiveCount = 3 e VisibilityTimeout = 2s, após ~4-6s o SQS move para a DLQ
         Awaitility.await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
             var dlqMessages = receiveMessagesFrom(dlqUrl);
             assertThat(dlqMessages).hasSize(1);
             assertThat(dlqMessages.get(0).body()).contains(payoutId);
         });
 
-        // Confirma que o consumidor tentou exatamente 3 vezes antes do SQS mover para a DLQ
-        verify(consumerSpy, times(3)).processPayout(command);
+        verify(gatewayClient, times(3)).sendToP2a(command);
+        assertThat(repository.findById(payoutId)).isEmpty();
         assertThat(receiveMessagesFrom(mainQueueUrl)).isEmpty();
     }
 
     @Test
-    void deveRecuperarComSucessoNaSegundaTentativaAposFalhaTransienteInicial() {
+    void deveRecuperarComSucessoNaSegundaTentativaSalvarNoBancoENaoSujaDlq() {
         String payoutId = UUID.randomUUID().toString();
         PayoutCommandMessage command = new PayoutCommandMessage(
                 payoutId,
@@ -248,23 +303,24 @@ class PayoutCommandConsumerIntegrationTest {
                 DEFAULT_IBAN
         );
 
-        // 1ª tentativa falha (HTTP 503), 2ª tentativa funciona
         doThrow(new RuntimeException("HTTP 503 Service Unavailable"))
                 .doNothing()
-                .when(consumerSpy).processPayout(command);
+                .when(gatewayClient).sendToP2a(command);
 
         sqsTemplate.send(MAIN_QUEUE_NAME, command);
 
-        Awaitility.await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
-                verify(consumerSpy, times(2)).processPayout(command)
-        );
+        Awaitility.await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
+            verify(gatewayClient, times(2)).sendToP2a(command);
+            var saved = repository.findById(payoutId);
+            assertThat(saved).isPresent();
+            assertThat(saved.get().getStatus()).isEqualTo(PayoutStatus.PAYOUT_SENT_TO_P2A);
+        });
 
-        // Garante que a mensagem foi confirmada na 2ª tentativa e não foi para a DLQ
         assertThat(receiveMessagesFrom(dlqUrl)).isEmpty();
         assertThat(receiveMessagesFrom(mainQueueUrl)).isEmpty();
     }
 
-    private java.util.List<software.amazon.awssdk.services.sqs.model.Message> receiveMessagesFrom(String queueUrl) {
+    private List<Message> receiveMessagesFrom(String queueUrl) {
         try {
             return sqsAsyncClient.receiveMessage(ReceiveMessageRequest.builder()
                     .queueUrl(queueUrl)

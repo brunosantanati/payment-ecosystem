@@ -18,7 +18,7 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
     healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      test: [ "CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -35,6 +35,23 @@ services:
       KAFKA_CLUSTERS_0_NAME: local-payment-cluster
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
 
+  postgres:
+    image: postgres:16-alpine
+    container_name: payment-postgres
+    environment:
+      POSTGRES_DB: payout_db
+      POSTGRES_USER: payout_user
+      POSTGRES_PASSWORD: payout_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - payout_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U payout_user -d payout_db" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   p2a:
     build:
       context: ./p2a
@@ -47,3 +64,31 @@ services:
       - "8080:8080"
     environment:
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+
+  payout-service:
+    build:
+      context: ./payout-service
+      dockerfile: Dockerfile
+    container_name: payout-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      p2a:
+        condition: service_started
+    ports:
+      - "8081:8081"
+    environment:
+      SERVER_PORT: 8081
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/payout_db
+      SPRING_DATASOURCE_USERNAME: payout_user
+      SPRING_DATASOURCE_PASSWORD: payout_pass
+      APP_P2A_BASE_URL: http://p2a:8080
+      AWS_REGION: us-east-1
+      # Monta suas credenciais AWS locais para o @SqsListener ler a fila real da AWS
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+    volumes:
+      - ~/.aws:/root/.aws:ro
+
+volumes:
+  payout_pgdata:
